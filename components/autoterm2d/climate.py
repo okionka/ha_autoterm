@@ -44,6 +44,7 @@ CONF_ERROR_TEXT               = "error_text"
 CONF_SOFTWARE_VERSION         = "software_version"
 CONF_STATUS_REPORT            = "status_report"
 CONF_REMAINING_WORK_TIME      = "remaining_work_time"
+CONF_DIAG_PORT                = "diagnostic_port"
 
 # ── Config schema ─────────────────────────────────────────────────────────────
 CONFIG_SCHEMA = (
@@ -58,6 +59,9 @@ CONFIG_SCHEMA = (
             # Input sensors
             cv.Optional(CONF_TEMPERATURE_SENSOR): cv.use_id(sensor.Sensor),
             cv.Optional(CONF_AIR_TEMP_SOURCE): cv.use_id(sensor.Sensor),
+
+            # TCP-Diagnoseproxy (Autoterm Test Software über WLAN)
+            cv.Optional(CONF_DIAG_PORT, default=8888): cv.port,
 
             # Numeric diagnostic sensors
             cv.Optional(CONF_HEATER_BOARD_TEMPERATURE): sensor.sensor_schema(
@@ -148,6 +152,9 @@ async def to_code(config):
         # Wire UART1 back to climate for heater→controller forwarding
         cg.add(var.set_controller_uart(panel_uart))
         # (if panel_uart_id absent: ctrl_uart_ stays nullptr → virtual-panel mode)
+
+    # ── TCP-Diagnoseproxy ─────────────────────────────────────────────────────
+    cg.add(var.set_diag_port(config[CONF_DIAG_PORT]))
 
     # ── Input sensors ─────────────────────────────────────────────────────────
     if CONF_TEMPERATURE_SENSOR in config:

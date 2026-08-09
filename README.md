@@ -17,6 +17,9 @@ diesel heaters with Home Assistant as a full **Climate** entity.
 | Diagnostic sensors | Battery voltage, intake temp, output temp, panel temp, fan Hz/RPM, fuel pump, error code, status code, firmware version |
 | Status text sensors | Human-readable heater state + error description |
 | Status report button | Formats full snapshot into a HA text sensor on demand |
+| Run timer | Work-time in minutes (0 = unlimited) + remaining-time sensor |
+| Power level | Settable 1–10, mainly relevant for the `By Power` preset |
+| TCP diagnostic proxy | Official Autoterm Test software over WiFi instead of a USB-TTL adapter |
 | Operating modes | **Bridge** (physical controller panel present) or **Virtual panel** (ESP32 standalone) |
 
 ---
@@ -64,14 +67,22 @@ Physical Heater ──UART2.RX──► Autoterm2DClimate
 
 ```
 ha_autoterm/
-├── autoterm2d.yaml          # Main ESPHome config (bridge mode example)
+├── autoterm2d.yaml           # Main ESPHome config (bridge mode example)
 ├── secrets.yaml.example      # Template – copy to secrets.yaml and fill in
-└── components/
-    └── autoterm2d/
-        ├── __init__.py       # Component namespace
-        ├── climate.py        # ESPHome codegen – registers both components
-        ├── autoterm2d.h     # Autoterm2DClimate C++ (UART2, heater side)
-        └── panel.h           # ControllerPanelComponent C++ (UART1, panel side)
+├── components/
+│   └── autoterm2d/
+│       ├── __init__.py       # Component namespace
+│       ├── climate.py        # ESPHome codegen – registers both components
+│       ├── autoterm2d.h      # Autoterm2DClimate (UART2, heater side)
+│       ├── panel.h           # ControllerPanelComponent (UART1, panel side)
+│       └── diag_proxy.h      # DiagProxyMixin – TCP proxy for Autoterm Test
+├── docs/                     # Additional guides (German)
+│   ├── DOCUMENTATION.md
+│   ├── PATCH_ANLEITUNG.md
+│   ├── USB_Proxy_Anleitung.md
+│   └── YAML_ERGAENZUNGEN.yaml
+└── tools/
+    └── tcp_to_com.py         # TCP ↔ virtual COM bridge for the host PC
 ```
 
 ---
@@ -208,7 +219,7 @@ Or use the **ESPHome Dashboard** in Home Assistant → Install → Wirelessly.
 |---|---|---|
 | `By T Heater` | 1 | Heater uses its own board temperature sensor |
 | `By T Panel` | 2 | Heater uses temperature from 0x11 messages (controller panel or virtual panel) |
-| `By T Air` | 3 | Heater uses its external air temperature sensor. If `air_temperature_source` is configured, the ESP32 sends 0x11 with that HA sensor value (max 2 °C jump per update, NaN rejected) |
+| `By T Air` | 3 | Heater uses its external air temperature sensor. If `air_temperature_source` is configured, the ESP32 sends 0x11 with that HA sensor value. Only while the heater is running; changes are limited to 2 °C per update and NaN / out-of-range values are dropped |
 | `By Power` | 4 | Fixed power level, no thermostat control |
 
 ### Diagnostic sensors & entities
@@ -226,8 +237,65 @@ Or use the **ESPHome Dashboard** in Home Assistant → Install → Wirelessly.
 | Heater Battery Voltage | Sensor | Supply voltage (V) |
 | Heater Air Temperature | Sensor | Output / external sensor temp (NaN if disconnected) |
 | Panel Temperature | Sensor | Controller panel ambient temp (from 0x11) |
-| Heater Power Level | Sensor | Current power level 1–10 |
+| Heater Power Level (reported) | Sensor | Power level reported by the heater, 1–10 |
 | Ventilator Power | Sensor | Fan actual frequency (Hz) |
+| Heater Remaining Time | Sensor | Remaining work time in minutes (0 = unlimited) |
+| Heater Timer | Number | Run time 0–255 min; 0 = unlimited |
+| Heater Power Level | Number | Sets power level 1–10 (used by the `By Power` preset) |
+
+---
+
+## Run timer
+
+The heater's own work-time function is exposed as a number entity:
+
+| Value | Behaviour |
+|---|---|
+| `0` | Unlimited – runs until stopped (payload bytes `0xFF 0xFF`) |
+| `1`–`255` | Shuts down automatically after N minutes (payload `0x00 N`) |
+
+The timer value is applied with the next start/settings command. **Heater Remaining
+Time** mirrors the countdown reported by the heater in its `0x02` echo.
+
+```yaml
+number:
+  - platform: template
+    name: "Heater Timer"
+    min_value: 0
+    max_value: 255
+    step: 1
+    initial_value: 0
+    optimistic: true
+    mode: box
+    set_action:
+      lambda: id(diesel_heater)->set_work_time((uint8_t)x);
+```
+
+---
+
+## TCP diagnostic proxy
+
+`DiagProxyMixin` exposes the heater UART as a raw TCP socket so the official
+**Autoterm Test** software can talk to the heater over WiFi instead of a
+USB-TTL adapter.
+
+| Setting | Value |
+|---|---|
+| Port | `diagnostic_port:` in the climate config (default `8888`) |
+| Framing | None – raw byte stream, identical to a physical COM port |
+| Serial settings in the software | 9600 8N1 |
+| Concurrent clients | Exactly one |
+| Authentication | None – protect via VLAN / firewall |
+
+While a client is connected, the virtual-panel poll cycle pauses so the
+diagnostic software owns the bus. In bridge mode the physical panel keeps
+polling and the client listens in and may inject its own commands.
+
+On the host PC, `tools/tcp_to_com.py` bridges the TCP socket to a virtual COM
+port (com0com on Windows, PTY on Linux/macOS) — see `docs/USB_Proxy_Anleitung.md`.
+
+The implementation uses lwip BSD sockets, so it builds under both the Arduino
+and the ESP-IDF framework (ESPHome 2026.7+ uses ESP-IDF for ESP32 targets).
 
 ---
 
@@ -240,6 +308,7 @@ The component uses three log tags:
 | `autoterm2d` | Interpreted protocol (STATUS, SETTINGS, TX commands) | `DEBUG` |
 | `heater` | Raw frame hex from heater (AA:04:…) | `DEBUG` |
 | `controller` | Raw frame hex from panel (AA:03:…) – bridge mode only | `DEBUG` |
+| `diag_proxy` | TCP client connect / disconnect events | `INFO` |
 
 Recommended logger config:
 
@@ -294,7 +363,11 @@ Byte 0    Byte 1    Byte 2        Byte 3   Byte 4      Byte 5 … N   N+1   N+2
 | Payload length | Number of bytes in payload field (0 for poll requests) |
 | Reserved | Always `0x00` |
 | Command ID | See table below |
-| CRC-16 | CRC-16 Modbus (poly `0x8005`, init `0xFFFF`), MSB first |
+| CRC-16 | CRC-16/MODBUS (poly `0x8005`, reflected `0xA001`, init `0xFFFF`), **MSB first** |
+
+> The CRC variant and byte order were verified against captured traffic from a
+> physical controller panel — all frames match CRC-16/MODBUS with the high byte
+> transmitted first.
 
 ---
 
@@ -317,12 +390,16 @@ Poll cycle (normal operation): `0x0F` → `0x11` → `0x02` → repeat every ~2 
 
 | Byte | Field | Notes |
 |---|---|---|
-| 0 | Work-time flag | `0` = use work time from byte 1 · `1` / `0xFF` = unlimited |
-| 1 | Work time | Minutes (valid when flag = 0). Heater default: 120 min |
+| 0 | Work-time flag | `0x00` = use work time from byte 1 · `0xFF` = unlimited |
+| 1 | Work time | Minutes (valid when flag = `0x00`), `0xFF` when unlimited. Heater default: 120 min |
 | 2 | Mode | `1` = By T Heater · `2` = By T Panel · `3` = By T Air · `4` = By Power |
-| 3 | Target temperature | °C, range 1–30 |
+| 3 | Target temperature | °C, range 1–30 (the component clamps HA values into this range) |
 | 4 | Ventilation | Controller→Heater: `1` = On · `2` = Off ·  Heater→Controller: `0` = Off · `1` = On |
-| 5 | Power level | 0–9 (used in By Power mode; updated by PID in other modes) |
+| 5 | Power level | 0–9 on the wire, shown as 1–10 in HA (used in By Power mode; updated by the heater's PID in other modes) |
+
+The heater sends its `0x02` echo continuously, including while in standby, so
+target temperature, preset, power level and remaining time stay in sync in HA
+even when the heater is off.
 
 `0x01` triggers ignition. `0x02` with empty payload reads settings; with payload updates them live.
 

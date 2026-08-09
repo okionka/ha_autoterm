@@ -102,6 +102,20 @@ number:
     set_action:
       lambda: id(diesel_heater)->set_work_time((uint8_t)x);
 
+  # Leistungsstufe – wirkt vor allem im Preset "By Power"
+  - platform: template
+    name: "Heater Power Level"
+    id: heater_power_level
+    icon: mdi:fire
+    min_value: 1
+    max_value: 10
+    step: 1
+    initial_value: 5
+    optimistic: true
+    mode: slider
+    set_action:
+      lambda: id(diesel_heater)->set_power_level((uint8_t)x);
+
 # ── UART ──────────────────────────────────────────────────────────────────────
 # UART1: Physical controller panel side (GPIO1 TX → panel, GPIO3 RX ← panel)
 #   Handled by ControllerPanelComponent: forwards panel bytes to UART2 TX,
@@ -168,12 +182,15 @@ climate:
     # Max 2 °C change per sensor update, NaN/out-of-range values rejected.
     air_temperature_source: room_temperature   # ← change as needed
 
+    # TCP-Diagnoseproxy für die Autoterm Test Software (Standard: 8888)
+    diagnostic_port: 8888
+
     # ── Status / control ─────────────────────────────────────────────────────
     status_text:
       name: "Heater Status"
 
     power_level:
-      name: "Heater Power Level"
+      name: "Heater Power Level (reported)"
 
     # ── Diagnostic ───────────────────────────────────────────────────────────
     status_code:

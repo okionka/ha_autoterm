@@ -18,6 +18,7 @@
 //    • Diagnostic sensors + status report button
 // ─────────────────────────────────────────────────────────────────────────────
 
+#include <algorithm>
 #include <cmath>
 #include "esphome.h"
 #include "esphome/core/version.h"
@@ -49,6 +50,9 @@ static constexpr float    AIR_TEMP_MAX_JUMP  = 2.0f;
 
 // Virtual panel poll cycle (ms between each request step)
 static constexpr uint32_t VPANEL_POLL_MS     = 2000;
+
+// Obergrenze für den Hex-Logpuffer eines Frames (verhindert unbegrenztes Wachsen)
+static constexpr size_t   MAX_LOG_FRAME_LEN  = 64;
 
 
 class Autoterm2DClimate : public climate::Climate,
@@ -88,6 +92,15 @@ class Autoterm2DClimate : public climate::Climate,
   void set_status_report_sensor(text_sensor::TextSensor *s)   { s_status_report_  = s; }
   void set_remaining_time_sensor(sensor::Sensor *s)           { s_remaining_time_ = s; }
 
+  // ── Leistungsstufe setzen (YAML number set_action), 1..10 ───────────────
+  void set_power_level(uint8_t level_1_10) {
+    if (level_1_10 < 1) level_1_10 = 1;
+    if (level_1_10 > 10) level_1_10 = 10;
+    power_level_ = level_1_10 - 1;                 // Protokoll ist 0-basiert
+    ESP_LOGD("autoterm2d", "Leistungsstufe gesetzt: %d/10", level_1_10);
+    if (this->mode == climate::CLIMATE_MODE_HEAT) send_control_command();
+  }
+
   // ── Timer control (called from YAML number set_action) ───────────────────
   // minutes == 0 → unlimited (sends flag 0xFF)
   // minutes  > 0 → timed run (sends flag 0x00 + minutes)
@@ -101,20 +114,28 @@ class Autoterm2DClimate : public climate::Climate,
   void publish_status_report() {
     if (!s_status_report_) return;
     const char *mode_str = ctrl_uart_ ? "Bridge (physical panel)" : "Virtual panel";
-    char buf[300];
+    char t2buf[12];
+    if (snap_t2_ok_) snprintf(t2buf, sizeof(t2buf), "%d°C", snap_t2_);
+    else             snprintf(t2buf, sizeof(t2buf), "n/a");
+    char timerbuf[16];
+    if (work_time_minutes_ == 0) snprintf(timerbuf, sizeof(timerbuf), "unlimited");
+    else                         snprintf(timerbuf, sizeof(timerbuf), "%u min", work_time_minutes_);
+    char buf[380];
     snprintf(buf, sizeof(buf),
-      "Mode: %s\n"
+      "Mode: %s | Diag: %s\n"
       "State: %s | Err: %s\n"
-      "Regulation: %s | Level: %d/10 | Vent: %s\n"
+      "Regulation: %s | Level: %d/10 | Vent: %s | Timer: %s\n"
       "T-intake: %d°C | T-out: %s | Flame: %.0f°C\n"
       "Battery: %.1fV | Fan: %d/%d Hz (%d/%d RPM) | Pump: %.2f Hz",
       mode_str,
+      is_diagnostic_active() ? diag_client_ip().c_str() : "-",
       state_description(snap_major_, snap_minor_),
       error_description(snap_error_),
       mode_description(snap_mode_), snap_level_ + 1,
       snap_vent_ == 1 ? "On" : "Off",
+      timerbuf,
       snap_t1_,
-      snap_t2_ok_ ? (std::to_string(snap_t2_) + "°C").c_str() : "n/a",
+      t2buf,
       snap_flame_c_,
       snap_volts_,
       snap_fan_sp_, snap_fan_act_,
@@ -170,7 +191,8 @@ class Autoterm2DClimate : public climate::Climate,
       read_byte(&b);
       if (ctrl_uart_) ctrl_uart_->write_byte(b);   // bridge: forward to panel
       diag_forward_rx_(b);                          // Diagnose-Client mitlauschen
-      heater_frame_buf_.push_back(b);
+      if (heater_frame_buf_.size() < MAX_LOG_FRAME_LEN)
+        heater_frame_buf_.push_back(b);             // Logpuffer begrenzen
       process_byte(b);
       got_byte = true;
     }
@@ -194,7 +216,7 @@ class Autoterm2DClimate : public climate::Climate,
 #endif
     t.set_supported_modes({climate::CLIMATE_MODE_OFF, climate::CLIMATE_MODE_HEAT});
     t.set_supported_fan_modes({climate::CLIMATE_FAN_ON, climate::CLIMATE_FAN_OFF});
-    t.set_visual_min_temperature(0.0f);
+    t.set_visual_min_temperature(1.0f);   // Protokollbereich 1..30 °C
     t.set_visual_max_temperature(30.0f);
     t.set_visual_temperature_step(1.0f);
     return t;
@@ -214,7 +236,9 @@ class Autoterm2DClimate : public climate::Climate,
       }
     }
     if (call.get_target_temperature().has_value()) {
-      temp_set_ = static_cast<uint8_t>(*call.get_target_temperature());
+      // Protokollbereich ist 1..30 °C – 0 würde die Heizung ablehnen
+      float req = *call.get_target_temperature();
+      temp_set_ = static_cast<uint8_t>(std::min(30.0f, std::max(1.0f, req)));
       this->target_temperature = temp_set_;
       needs_send = true;
     }
@@ -453,8 +477,7 @@ class Autoterm2DClimate : public climate::Climate,
   void send_control_command() { send_frame(CMD_START); }
 
   void send_shutdown_command() {
-    const uint8_t raw[] = {0xAA, 0x03, 0x00, 0x00, 0x03, 0x5D, 0x7C};
-    write_array(raw, sizeof(raw));
+    send_poll_request(CMD_STOP);          // CRC wird berechnet statt hartkodiert
     ESP_LOGD("autoterm2d", "TX SHUTDOWN");
   }
 
@@ -470,8 +493,7 @@ class Autoterm2DClimate : public climate::Climate,
   }
 
   void request_version() {
-    const uint8_t req[] = {0xAA, 0x03, 0x00, 0x00, 0x06, 0x5E, 0xBC};
-    write_array(req, sizeof(req));
+    send_poll_request(CMD_VERSION);       // CRC wird berechnet statt hartkodiert
     ESP_LOGD("autoterm2d", "TX 0x06 version request");
   }
 
@@ -500,7 +522,12 @@ class Autoterm2DClimate : public climate::Climate,
           message_data_.clear(); parse_start_ms_ = millis(); read_state_ = 1;
         }
         break;
-      case 1: read_state_ = 2; break;
+      case 1:
+        // Absender: 0x03 = Bedienteil, 0x04 = Heizung. Alles andere ist
+        // Rauschen oder ein Fehlsync auf einem 0xAA im Payload.
+        if (byte != 0x03 && byte != 0x04) { reset_parser(); break; }
+        read_state_ = 2;
+        break;
       case 2:
         if (byte == 0 || byte > MAX_PAYLOAD_LEN) {
           ESP_LOGW("autoterm2d", "Bad length 0x%02X", byte); reset_parser();
@@ -581,7 +608,14 @@ class Autoterm2DClimate : public climate::Climate,
   }
 
   void handle_settings() {
-    if (major_state_ == 0) return;
+    // Kein major_state_-Guard: die Heizung sendet das Settings-Echo auch im
+    // Standby (Status 0.1). Wird es dort verworfen, bleiben Power-Level,
+    // Restlaufzeit, Preset und Zieltemperatur in HA leer bis zum ersten Start.
+    if (message_data_.size() < 6) {
+      ESP_LOGW("autoterm2d", "SETTINGS zu kurz (%d Byte) – verworfen",
+               (int) message_data_.size());
+      return;
+    }
     bool    use_time = (safe_byte(0) == 0);
     uint8_t work_min = safe_byte(1);
     uint8_t mode     = safe_byte(2);
