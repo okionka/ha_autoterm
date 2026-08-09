@@ -4,6 +4,13 @@ substitutions:
   device_ip:  "192.168.7.6"
   gateway_ip: "192.168.7.1"
 
+  # UART-Pins (siehe Hardware-Abschnitt im README)
+  # UART1 = Bedienteil, UART2 = Heizung
+  controller_tx_pin: GPIO1     # ⚠ zugleich USB-Serial TX
+  controller_rx_pin: GPIO3     # ⚠ zugleich USB-Serial RX
+  heater_tx_pin:     GPIO17
+  heater_rx_pin:     GPIO16
+
 # ── External component ────────────────────────────────────────────────────────
 external_components:
   - source: github://okionka/ha_autoterm@main
@@ -123,16 +130,16 @@ number:
 uart:
   - id: uart_1_controller
     baud_rate: 9600
-    tx_pin: GPIO1
-    rx_pin: GPIO3
+    tx_pin: ${controller_tx_pin}
+    rx_pin: ${controller_rx_pin}
 
 # UART2: Physical heater side (GPIO17 TX → heater, GPIO16 RX ← heater)
 #   Handled by Autoterm2DClimate: forwards heater bytes to UART1 TX,
 #   parses protocol, manages Climate entity, sends HA commands to heater.
   - id: uart_2_heater
     baud_rate: 9600
-    tx_pin: GPIO17
-    rx_pin: GPIO16
+    tx_pin: ${heater_tx_pin}
+    rx_pin: ${heater_rx_pin}
 
 # ── Room temperature sensor (current_temperature in HA) ───────────────────────
 # Any ESPHome sensor works: homeassistant, dht, dallas, etc.

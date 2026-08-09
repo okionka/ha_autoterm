@@ -87,35 +87,127 @@ ha_autoterm/
 
 ---
 
-## Hardware wiring
+## Hardware
 
-### Bridge mode
-The ESP32 interacts as a man-in-the-middle between Autoterm Comfort Control and Autoterm Air 2D.
+The ESP32 sits between the Autoterm Comfort Control panel and the Autoterm Air 2D
+heater, and is powered from the heater's own 12 V supply.
+
+### Block diagram
 
 ```
-Physical Panel ←──5V TTL──→ ESP32 UART1 ←──5V TTL──→ Physical Heater
-                            GPIO1 TX  →  panel RX        GPIO17 TX  →  heater RX
-                            GPIO3  RX ←  panel TX        GPIO16 RX  ←  heater TX
+        Heater harness (4-wire)                    Panel harness (4-wire)
+     ┌───────────────────────────┐              ┌──────────────────────────┐
+     │ +12V  GND  TX(5V) RX(5V)  │              │ +12V  GND  TX(5V) RX(5V) │
+     └───┬────┬─────┬──────┬─────┘              └───┬────┬─────┬──────┬────┘
+         │    │     │      │                        │    │     │      │
+         │    │     │      │   ┌────────────────────┘    │     │      │
+         │    │     │      │   │  (+12V/GND passed through to the panel)
+         │    │     │      │   │  ┌──────────────────────┘     │      │
+         │    │     │      │   │  │                            │      │
+   ┌─────┴────┴──┐  │      │   │  │                            │      │
+   │  DC-DC buck │  │      │   │  │                            │      │
+   │  12V → 5V   │  │      │   │  │                            │      │
+   │  + C_in     │  │      │   │  │                            │      │
+   └──────┬───┬──┘  │      │   │  │                            │      │
+      5V  │   │ GND │      │   │  │                            │      │
+          │   │     │      │   │  │                            │      │
+    ┌─────┴───┴─────┴──────┴───┴──┴────────────────────────────┴──────┴────┐
+    │              5 V side  (HV)   –  level shifter                       │
+    │   HV = 5 V   HV1 ← heater TX   HV2 → heater RX                       │
+    │               HV3 ← panel  TX   HV4 → panel  RX                      │
+    ├──────────────────────────────────────────────────────────────────────┤
+    │              3.3 V side (LV)                                         │
+    │   LV = 3V3   LV1 → GPIO16      LV2 ← GPIO17                          │
+    │               LV3 → GPIO3       LV4 ← GPIO1                          │
+    └──────┬──────────────┬───────────────────────────────────────────────-┘
+           │              │
+      ┌────┴──────────────┴────────────────────────────────┐
+      │  ESP32-WROOM-32 DevKit                             │
+      │  5V ← buck output      3V3 → level shifter LV      │
+      │  GPIO16/17 = UART2 (heater)                        │
+      │  GPIO3/1   = UART0/UART1 (panel)  ⚠ see note       │
+      │  Micro-USB → firmware flashing / serial console     │
+      └────────────────────────────────────────────────────┘
 ```
-ToDo:
-* document wiring
 
-usd components:
-* Power supply: BuckConverter from 12v to 5v (using 12v from Heater) 
-* Signal Level Shifter to convert both TX/RX UART signals from Heater (5v) to esp32 (3,3V)
-* Cable Plugs
+### Bill of materials
 
-### Virtual-panel mode
-The ESP32 e
+| # | Part | Purpose |
+|---|---|---|
+| 1 | ESP32-WROOM-32 DevKit | Controller, mounted on female headers so it stays swappable |
+| 2 | DC-DC buck converter 12 V → 5 V (≥ 500 mA) | Powers the ESP32 from the heater's 12 V line |
+| 3 | Electrolytic capacitor ≈ 470 µF / 25 V at the buck input | Buffers the 12 V rail against starter/glow-plug dips |
+| 4 | 4-channel bidirectional level shifter (BSS138 / TXS0108E) | Converts both UARTs between 5 V bus and 3.3 V ESP32 |
+| 5 | 3 × 2-pin screw terminal | 12 V input, heater harness, panel harness |
+| 6 | 2 × lever connector (WAGO 221 or similar) | 5 V and GND distribution rails |
+| 7 | Perfboard + enclosure | Mechanical assembly |
+
+### 1 — Power supply (12 V → 5 V)
+
+The heater's supply line feeds the buck converter; its 5 V output powers the
+ESP32 through the `5V` pin (not `3V3`, the on-board regulator is bypassed).
+
+| From | To | Note |
+|---|---|---|
+| Heater harness `+12V` | Screw terminal `+` → buck `IN+` | Capacitor across `IN+`/`IN−` |
+| Heater harness `GND` | Screw terminal `−` → buck `IN−` | Common ground for everything |
+| Buck `OUT+` (5 V) | Lever connector → ESP32 `5V`, level shifter `HV` | Set the converter to 5.0 V **before** connecting the ESP32 |
+| Buck `OUT−` | Lever connector → ESP32 `GND`, level shifter `GND` | |
+
+> Automotive 12 V can dip hard while the glow plug draws current. The input
+> capacitor and a buck converter rated well above the actual load keep the ESP32
+> from browning out during ignition.
+
+### 2 — Heater and panel connectors
+
+Both harnesses carry the same four wires. `+12V` and `GND` are simply passed
+through so the panel keeps its original supply.
+
+| Wire | Heater side | Panel side |
+|---|---|---|
+| `+12V` | from heater | passed through to panel |
+| `GND` | from heater | passed through to panel |
+| `TX` (5 V, heater/panel output) | → level shifter `HV1` | → level shifter `HV3` |
+| `RX` (5 V, heater/panel input) | ← level shifter `HV2` | ← level shifter `HV4` |
+
+In **virtual-panel mode** the panel harness is left unconnected; only the heater
+side and channels HV1/HV2 are used.
+
+### 3 — Level shifter (5 V ↔ 3.3 V)
+
+The heater bus is **5 V TTL**; the ESP32 is **not** 5 V tolerant. Feed `HV` from
+the buck's 5 V output and `LV` from the ESP32's `3V3` pin, and share `GND`.
+
+| Channel | 5 V side (HV) | 3.3 V side (LV) | ESP32 | Direction |
+|---|---|---|---|---|
+| 1 | heater TX | LV1 | GPIO16 (UART2 RX) | heater → ESP32 |
+| 2 | heater RX | LV2 | GPIO17 (UART2 TX) | ESP32 → heater |
+| 3 | panel TX | LV3 | GPIO3 (UART RX) | panel → ESP32 |
+| 4 | panel RX | LV4 | GPIO1 (UART TX) | ESP32 → panel |
+
+### 4 — ESP32 and firmware updates
+
+The micro-USB port is used for the initial flash and for a serial console.
+
+> **⚠️ GPIO1 / GPIO3 are the USB serial pins.** The panel harness shares them
+> with the USB-to-UART bridge, so:
+>
+> - `logger:` must keep `baud_rate: 0`, otherwise ESPHome's log output is
+>   injected into the panel bus and corrupts the protocol.
+> - **Disconnect the panel harness before flashing over USB**, otherwise the
+>   panel and the USB bridge drive the same line against each other.
+> - After the first flash, use **OTA** — then the panel can stay connected.
+>
+> If you would rather keep USB permanently usable, move the panel UART to two
+> free pins (for example GPIO25 / GPIO26) — the pins are exposed as substitutions:
+
+```yaml
+substitutions:
+  controller_tx_pin: GPIO1     # panel  – also USB serial TX
+  controller_rx_pin: GPIO3     # panel  – also USB serial RX
+  heater_tx_pin:     GPIO17    # heater
+  heater_rx_pin:     GPIO16    # heater
 ```
-ESP32 UART2 ←──5V TTL──→ Physical Heater
-GPIO17 TX  →  heater RX
-GPIO16 RX  ←  heater TX
-```
-
-> **⚠️ Voltage level:** The heater bus operates at **5 V TTL**.
-> A bidirectional logic-level shifter (e.g. TXS0108E) is required between the
-> 3.3 V ESP32 and the 5 V UART lines.
 
 ---
 
