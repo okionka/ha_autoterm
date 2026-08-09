@@ -20,6 +20,7 @@
 
 #include <cmath>
 #include "esphome.h"
+#include "esphome/core/version.h"
 #include "esphome/components/climate/climate.h"
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/text_sensor/text_sensor.h"
@@ -184,7 +185,13 @@ class Autoterm2DClimate : public climate::Climate,
   // ── Climate traits ─────────────────────────────────────────────────────────
   climate::ClimateTraits traits() override {
     auto t = climate::ClimateTraits();
+    // ESPHome 2026.5.0 deprecated set_supports_current_temperature() and
+    // removed it in 2026.7.0 – replaced by the ClimateFeature bit flags.
+#if defined(ESPHOME_VERSION_CODE) && ESPHOME_VERSION_CODE >= VERSION_CODE(2026, 5, 0)
+    t.add_feature_flags(climate::CLIMATE_SUPPORTS_CURRENT_TEMPERATURE);
+#else
     t.set_supports_current_temperature(true);
+#endif
     t.set_supported_modes({climate::CLIMATE_MODE_OFF, climate::CLIMATE_MODE_HEAT});
     t.set_supported_fan_modes({climate::CLIMATE_FAN_ON, climate::CLIMATE_FAN_OFF});
     t.set_visual_min_temperature(0.0f);
