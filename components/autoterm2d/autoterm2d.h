@@ -163,13 +163,16 @@ class Autoterm2DClimate : public climate::Climate,
     } else {
       ESP_LOGI("autoterm2d", "Starting in VIRTUAL-PANEL mode (ESP32 drives poll cycle)");
     }
-    diag_setup_();  // TCP-Diagnoseserver starten (Port 8888)
+    // diag_setup_() wird NICHT hier aufgerufen: zu diesem Zeitpunkt ist der
+    // Netzwerk-Stack unter ESP-IDF noch nicht bereit (DATA-Prio läuft vor WiFi).
+    // Der Server startet in loop() via diag_ensure_started_().
   }
 
   void loop() override {
     const uint32_t now = millis();
 
-    // ── Diagnose-Proxy: Client verwalten + TCP→UART senden ──────────────────
+    // ── Diagnose-Proxy: Server starten sobald WLAN steht, Client verwalten ──
+    diag_ensure_started_();
     diag_loop_tick_();
     diag_drain_tx_([this](uint8_t b) { write_byte(b); });
     // ────────────────────────────────────────────────────────────────────────

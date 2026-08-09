@@ -37,6 +37,7 @@
 #include <functional>
 #include <string>
 #include "esphome/core/log.h"
+#include "esphome/components/network/util.h"
 
 namespace esphome {
 namespace autoterm2d {
@@ -63,7 +64,20 @@ class DiagProxyMixin {
  protected:
   // ── Lifecycle ─────────────────────────────────────────────────────────────
 
-  /// In setup() aufrufen – startet den TCP-Server
+  /// In loop() aufrufen – startet den TCP-Server sobald das Netzwerk steht.
+  ///
+  /// WICHTIG: Nicht in setup() starten. Komponenten mit setup_priority::DATA
+  /// (600) laufen VOR der WiFi-Komponente (250). Unter ESP-IDF ist der
+  /// lwIP-Stack zu diesem Zeitpunkt noch nicht initialisiert – ein
+  /// ::socket()-Aufruf schlägt dort fehl bzw. bricht den Boot ab.
+  /// Unter Arduino fiel das nicht auf, weil das Framework lwIP früh startet.
+  void diag_ensure_started_() {
+    if (diag_started_ || !network::is_connected()) return;
+    diag_started_ = true;
+    diag_setup_();
+  }
+
+  /// Legt den Server-Socket an (wird von diag_ensure_started_() aufgerufen)
   void diag_setup_() {
     server_fd_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (server_fd_ < 0) {
@@ -159,6 +173,7 @@ class DiagProxyMixin {
 
  private:
   uint16_t    diag_port_{8888};
+  bool        diag_started_{false};
   int         server_fd_{-1};
   int         client_fd_{-1};
   std::string client_ip_;

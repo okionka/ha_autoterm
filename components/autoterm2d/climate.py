@@ -14,7 +14,7 @@ from esphome.const import (
 )
 
 DEPENDENCIES = ["uart", "climate"]
-AUTO_LOAD = ["sensor", "text_sensor"]
+AUTO_LOAD = ["sensor", "text_sensor", "network"]
 CODEOWNERS = ["@okionka"]
 
 autoterm2d_ns = cg.esphome_ns.namespace("autoterm2d")
