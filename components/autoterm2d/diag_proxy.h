@@ -4,12 +4,6 @@
 //  Fasst die Heizungs-UART in einen WiFi-TCP-Socket, sodass die offizielle
 //  Autoterm Test-Software über einen virtuellen COM-Port zugreifen kann.
 //
-//  Nutzung:
-//    1. Diese Datei in components/autoterm2d/ ablegen.
-//    2. In autoterm2d.h: DiagProxyMixin als Basisklasse hinzufügen,
-//       drei Aufrufe in setup()/loop() einfügen (siehe PATCH_ANLEITUNG.md).
-//    3. autoterm2d.yaml um den binary_sensor erweitern (Vorlage weiter unten).
-//
 //  Protokoll:
 //    – Port 8888 (konfigurierbar per set_diag_port())
 //    – Roher Byte-Stream, kein Framing – identisch zum physischen COM-Port
@@ -19,22 +13,29 @@
 //    Bridge-Modus (physisches Bedienteil vorhanden):
 //      Bedienteil treibt weiterhin den Poll-Zyklus. Der TCP-Client empfängt
 //      alle Heizungsantworten und kann eigene Befehle einspeisen.
-//      Beide Bus-Teilnehmer schreiben selten gleichzeitig – Kollisionen sind
-//      unwahrscheinlich und führen nur zu einem verworfenen Frame.
 //
 //    Virtuell-Panel-Modus (kein physisches Bedienteil):
-//      Sobald ein TCP-Client verbunden ist, pausiert der interne Poll-Zyklus
-//      vollständig. Die Diagnosesoftware übernimmt die Bus-Steuerung.
+//      Sobald ein TCP-Client verbunden ist, pausiert der interne Poll-Zyklus.
 //      Nach Trennung des Clients nimmt der ESP32 den Poll-Betrieb wieder auf.
+//
+//  Implementierung:
+//    Verwendet lwip-BSD-Sockets statt WiFiServer/WiFiClient. Damit läuft der
+//    Code sowohl unter dem Arduino- als auch unter dem ESP-IDF-Framework.
+//    ESPHome 2026.7+ baut ESP32-Ziele mit ESP-IDF, wo die Arduino-Header
+//    WiFiServer.h / WiFiClient.h nicht existieren.
 //
 //  Sicherheit:
 //    Der Server akzeptiert genau einen Client gleichzeitig.
 //    Kein Auth – Zugriffsschutz über Netzwerksegmentierung (VLAN/Firewall).
 // ============================================================================
 
-#include <WiFiServer.h>
-#include <WiFiClient.h>
+#include <lwip/sockets.h>
+#include <lwip/inet.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <cstring>
 #include <functional>
+#include <string>
 #include "esphome/core/log.h"
 
 namespace esphome {
@@ -52,12 +53,11 @@ class DiagProxyMixin {
 
   // ── Status-Abfrage ────────────────────────────────────────────────────────
   /// true solange ein TCP-Diagnoseclient verbunden ist
-  bool is_diagnostic_active() const { return diagnostic_active_; }
+  bool is_diagnostic_active() const { return client_fd_ >= 0; }
 
   /// IP-Adresse des verbundenen Clients (oder "" wenn keiner)
   std::string diag_client_ip() const {
-    if (!diagnostic_active_) return "";
-    return diag_client_ip_;
+    return (client_fd_ >= 0) ? client_ip_ : std::string();
   }
 
  protected:
@@ -65,9 +65,33 @@ class DiagProxyMixin {
 
   /// In setup() aufrufen – startet den TCP-Server
   void diag_setup_() {
-    diag_server_ = new WiFiServer(diag_port_);
-    diag_server_->begin();
-    diag_server_->setNoDelay(true);
+    server_fd_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (server_fd_ < 0) {
+      ESP_LOGE(DIAG_TAG, "socket() fehlgeschlagen (errno %d) – Proxy inaktiv", errno);
+      return;
+    }
+
+    int yes = 1;
+    ::setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port        = htons(diag_port_);
+
+    if (::bind(server_fd_, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) != 0) {
+      ESP_LOGE(DIAG_TAG, "bind() auf Port %u fehlgeschlagen (errno %d)", diag_port_, errno);
+      close_server_();
+      return;
+    }
+    if (::listen(server_fd_, 1) != 0) {
+      ESP_LOGE(DIAG_TAG, "listen() fehlgeschlagen (errno %d)", errno);
+      close_server_();
+      return;
+    }
+    set_nonblocking_(server_fd_);
+
     ESP_LOGI(DIAG_TAG,
              "TCP-Diagnoseserver läuft auf Port %u  (Baud 9600 8N1 in der "
              "Diagnosesoftware einstellen)",
@@ -77,33 +101,33 @@ class DiagProxyMixin {
   /// Am Anfang von loop() aufrufen – verwaltet Client-Verbindungen
   /// Gibt true zurück wenn ein Client verbunden ist
   bool diag_loop_tick_() {
-    if (!diag_server_) return false;
+    if (server_fd_ < 0) return false;
 
     // ── Neue Verbindung annehmen ──────────────────────────────────────────
-    if (!diag_connected_()) {
-      WiFiClient incoming = diag_server_->accept();
-      if (incoming) {
-        if (diag_client_) diag_client_.stop();
-        diag_client_ = incoming;
-        diag_client_.setNoDelay(true);
-        diag_client_ip_ = diag_client_.remoteIP().toString().c_str();
-        diagnostic_active_ = true;
+    if (client_fd_ < 0) {
+      struct sockaddr_in caddr;
+      socklen_t clen = sizeof(caddr);
+      memset(&caddr, 0, sizeof(caddr));
+      int fd = ::accept(server_fd_, reinterpret_cast<struct sockaddr *>(&caddr), &clen);
+      if (fd >= 0) {
+        set_nonblocking_(fd);
+        int flag = 1;
+        ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+        client_fd_ = fd;
+
+        char ipbuf[INET_ADDRSTRLEN] = {0};
+        if (inet_ntop(AF_INET, &caddr.sin_addr, ipbuf, sizeof(ipbuf)) != nullptr)
+          client_ip_ = ipbuf;
+        else
+          client_ip_ = "?";
+
         ESP_LOGI(DIAG_TAG,
                  "Diagnose-Client verbunden: %s  –  Poll-Zyklus pausiert",
-                 diag_client_ip_.c_str());
+                 client_ip_.c_str());
       }
     }
 
-    // ── Verbindungsabbruch erkennen ───────────────────────────────────────
-    if (diagnostic_active_ && !diag_connected_()) {
-      diag_client_.stop();
-      diag_client_ip_ = "";
-      diagnostic_active_ = false;
-      ESP_LOGI(DIAG_TAG,
-               "Diagnose-Client getrennt  –  normaler Betrieb wird fortgesetzt");
-    }
-
-    return diagnostic_active_;
+    return client_fd_ >= 0;
   }
 
   /// Nach dem Lesen eines UART-Bytes aus der Heizung aufrufen:
@@ -111,33 +135,56 @@ class DiagProxyMixin {
   ///   diag_forward_rx_(b);     ← dieses hier
   /// Leitet das Byte zusätzlich an den TCP-Client weiter.
   void diag_forward_rx_(uint8_t byte) {
-    if (diagnostic_active_ && diag_connected_()) {
-      diag_client_.write(byte);
-    }
+    if (client_fd_ < 0) return;
+    int n = ::send(client_fd_, &byte, 1, 0);
+    if (n < 0 && errno != EWOULDBLOCK && errno != EAGAIN)
+      disconnect_client_("Schreibfehler");
   }
 
   /// Liest Bytes vom TCP-Client und übergibt sie an uart_write_fn.
   /// uart_write_fn(b) soll das Byte auf UART2 TX senden.
-  /// Max. 64 Bytes pro Loop-Tick (kein Watchdog-Risk).
+  /// Max. 64 Bytes pro Loop-Tick (kein Watchdog-Risiko).
   void diag_drain_tx_(const std::function<void(uint8_t)> &uart_write_fn) {
-    if (!diagnostic_active_ || !diag_connected_()) return;
-    uint8_t count = 0;
-    while (diag_client_.available() && count < 64) {
-      uint8_t b = static_cast<uint8_t>(diag_client_.read());
-      uart_write_fn(b);
-      ++count;
+    if (client_fd_ < 0) return;
+    uint8_t buf[64];
+    int n = ::recv(client_fd_, buf, sizeof(buf), 0);
+    if (n > 0) {
+      for (int i = 0; i < n; i++) uart_write_fn(buf[i]);
+    } else if (n == 0) {
+      disconnect_client_("Client hat Verbindung geschlossen");
+    } else if (errno != EWOULDBLOCK && errno != EAGAIN) {
+      disconnect_client_("Lesefehler");
     }
   }
 
  private:
   uint16_t    diag_port_{8888};
-  WiFiServer *diag_server_{nullptr};
-  WiFiClient  diag_client_;
-  bool        diagnostic_active_{false};
-  std::string diag_client_ip_;
+  int         server_fd_{-1};
+  int         client_fd_{-1};
+  std::string client_ip_;
 
-  bool diag_connected_() {
-    return diag_client_ && diag_client_.connected();
+  static void set_nonblocking_(int fd) {
+    int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags < 0) flags = 0;
+    ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+  }
+
+  void close_server_() {
+    if (server_fd_ >= 0) {
+      ::close(server_fd_);
+      server_fd_ = -1;
+    }
+  }
+
+  void disconnect_client_(const char *reason) {
+    if (client_fd_ >= 0) {
+      ::close(client_fd_);
+      client_fd_ = -1;
+    }
+    client_ip_.clear();
+    ESP_LOGI(DIAG_TAG,
+             "Diagnose-Client getrennt (%s)  –  normaler Betrieb wird fortgesetzt",
+             reason);
   }
 };
 
